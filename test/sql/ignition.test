@@ -1,0 +1,23 @@
+# name: test/sql/ignition.test
+# description: test ignition extension
+# group: [ignition]
+
+# Before we load the extension, this will fail
+statement error
+SELECT ignition('Sam');
+----
+Catalog Error: Scalar Function with name ignition does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require ignition
+
+# Confirm the extension works
+query I
+SELECT ignition('Sam');
+----
+Ignition Sam 🐥
+
+query I
+SELECT ignition_openssl_version('Michael') ILIKE 'Ignition Michael, my linked OpenSSL version is OpenSSL%';
+----
+true
