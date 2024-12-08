@@ -6,7 +6,7 @@ set(TARGET_NAME ignition)
 set(CMAKE_CXX_STANDARD 20)
 
 # Ignition
-find_package(IgnitionCpp 0.8.2 REQUIRED)
+find_package(IgnitionCpp 0.8.3 REQUIRED)
 message(STATUS "Found Ignition CPP library '${IgnitionCpp_VERSION}'")
 
 

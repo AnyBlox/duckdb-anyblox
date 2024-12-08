@@ -17,7 +17,7 @@ ignition::Runtime InitRuntime() {
 	auto config_builder = ignition::config::ConfigBuilder::create();
 	config_builder.compile_with_debug(true)
 	    ->set_log_level(ignition::config::LogLevel::Debug)
-	    ->set_wasm_cache_limit(2UL * 1024 * 1024);
+	    ->set_wasm_cache_limit(64UL * 1024 * 1024);
 	auto config = config_builder.build();
 	return ignition::Runtime::create(std::move(config));
 }
@@ -107,12 +107,18 @@ public:
 	}
 
 	std::optional<JobParams> AcquireNextJob() {
-		if (next_job_start == row_count) {
-			return {};
+		uint64_t start_tuple;
+
+		{
+			lock_guard<mutex> parallel_lock{main_mutex};
+			if (next_job_start >= row_count) {
+				return {};
+			}
+			start_tuple = next_job_start;
+			next_job_start += rows_per_job;
 		}
-		JobParams job = {.start_tuple = next_job_start,
-		                 .tuple_count = std::min(rows_per_job, row_count - next_job_start)};
-		next_job_start += job.tuple_count;
+
+		JobParams job = {.start_tuple = start_tuple, .tuple_count = std::min(rows_per_job, row_count - start_tuple)};
 
 		return job;
 	}
@@ -123,6 +129,8 @@ public:
 
 private:
 	const uint64_t MIN_JOB_SIZE = STANDARD_VECTOR_SIZE;
+
+	mutable mutex main_mutex;
 
 	ignition::IgnitionBundle bundle;
 	std::shared_ptr<arrow::Schema> schema;
@@ -137,10 +145,8 @@ private:
 
 class IgnitionLocalState : public LocalTableFunctionState {
 public:
-	explicit IgnitionLocalState(const ignition::IgnitionBundle &bundle, JobParams job_params,
-	                            ignition::ColumnProjection column_projection)
-	    : ignition_job(std::move(IGNITION.decode_job_init(bundle, column_projection)).ValueOrDie()),
-	      job_params(job_params) {
+	explicit IgnitionLocalState(const ignition::IgnitionBundle &bundle, ignition::ColumnProjection column_projection)
+	    : ignition_job(std::move(IGNITION.decode_job_init(bundle, column_projection)).ValueOrDie()), job_params({}) {
 	}
 
 	void ReadBatch(DataChunk &output, const vector<OutputColumnId> &output_column_ids);
@@ -437,11 +443,7 @@ unique_ptr<LocalTableFunctionState> IgnitionLocalInit(ExecutionContext & /* cont
                                                       TableFunctionInitInput & /* input */,
                                                       GlobalTableFunctionState *global_state) {
 	auto &ignition_state = global_state->Cast<IgnitionGlobalState>();
-	auto job = ignition_state.AcquireNextJob();
-
-	return job.has_value() ? make_uniq<IgnitionLocalState>(ignition_state.GetBundle(), job.value(),
-	                                                       ignition_state.GetColumnProjection())
-	                       : nullptr;
+	return make_uniq<IgnitionLocalState>(ignition_state.GetBundle(), ignition_state.GetColumnProjection());
 }
 
 unique_ptr<NodeStatistics> IgnitionCardinality(ClientContext & /* context */, const FunctionData *bind_data) {
@@ -452,6 +454,9 @@ unique_ptr<NodeStatistics> IgnitionCardinality(ClientContext & /* context */, co
 
 unique_ptr<BaseStatistics> IgnitionStatistics(ClientContext & /* context */, const FunctionData *bind_data,
                                               column_t column_index) {
+	if (column_index == COLUMN_IDENTIFIER_ROW_ID) {
+		return nullptr;
+	}
 	const auto &ignition_data = bind_data->Cast<IgnitionFunctionData>();
 	const auto &column = ignition_data.GetMetadata().schema->fields()[column_index];
 
