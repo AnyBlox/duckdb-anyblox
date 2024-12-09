@@ -7,6 +7,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension_util.hpp"
 
+#include <duckdb/common/types/arrow_string_view_type.hpp>
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include <fmt/core.h>
 #include <ignition/ignition.hpp>
@@ -17,6 +18,7 @@ ignition::Runtime InitRuntime() {
 	auto config_builder = ignition::config::ConfigBuilder::create();
 	config_builder.compile_with_debug(true)
 	    ->set_log_level(ignition::config::LogLevel::Debug)
+		->set_memory_cache_virtual_memory_limit(64UL * 1024 * 1024 * 1024 * 1024)
 	    ->set_wasm_cache_limit(64UL * 1024 * 1024);
 	auto config = config_builder.build();
 	return ignition::Runtime::create(std::move(config));
@@ -110,7 +112,7 @@ public:
 		uint64_t start_tuple;
 
 		{
-			lock_guard<mutex> parallel_lock{main_mutex};
+			lock_guard<mutex> parallel_lock {main_mutex};
 			if (next_job_start >= row_count) {
 				return {};
 			}
@@ -146,7 +148,8 @@ private:
 class IgnitionLocalState : public LocalTableFunctionState {
 public:
 	explicit IgnitionLocalState(const ignition::IgnitionBundle &bundle, ignition::ColumnProjection column_projection)
-	    : ignition_job(std::move(IGNITION.decode_job_init(bundle, column_projection)).ValueOrDie()), job_params({}) {
+	    : ignition_job(std::move(IGNITION.decode_job_init(bundle, column_projection)).ValueOrDie()),
+	      current_batch(nullptr), job_params(JobParams {.start_tuple = 0, .tuple_count = 0}) {
 	}
 
 	void ReadBatch(DataChunk &output, const vector<OutputColumnId> &output_column_ids);
@@ -155,11 +158,19 @@ public:
 
 private:
 	std::unique_ptr<ignition::ThreadLocalDecodeJob> ignition_job;
+	shared_ptr<ArrowArrayWrapper> current_batch;
+	idx_t current_batch_idx = 0;
 	JobParams job_params;
 
-	static void SetValidityMask(Vector &vector, ArrowArray &array);
-	static void ColumnArrowToDuckDB(Vector &vector, ArrowArray &array, const arrow::DataType &arrow_type);
+	uint64_t RemainingInBatch() const {
+		return current_batch == nullptr ? 0 : current_batch->arrow_array.length - current_batch_idx;
+	}
+
+	static void SetValidityMask(Vector &vector, ArrowArray &array, idx_t offset, size_t len);
+	static void ColumnArrowToDuckDB(Vector &vector, ArrowArray &array, const arrow::DataType &arrow_type, idx_t offset,
+	                                size_t len);
 	static void SetVectorString(Vector &vector, const char *cdata, const uint32_t *offsets, idx_t size);
+	static void SetVectorStringView(Vector &vector, idx_t size, ArrowArray &array, idx_t offset);
 
 	class ArrayHandleAuxiliaryData : public VectorAuxiliaryData {
 	public:
@@ -173,14 +184,17 @@ private:
 };
 
 void IgnitionLocalState::ReadBatch(DataChunk &output, const vector<OutputColumnId> &output_column_ids) {
-	auto request_size = std::min(static_cast<uint64_t>(STANDARD_VECTOR_SIZE), job_params.tuple_count);
+	if (RemainingInBatch() == 0) {
+		auto request_size = std::min(static_cast<uint64_t>(STANDARD_VECTOR_SIZE) * 50, job_params.tuple_count);
+		current_batch = make_shared_ptr<ArrowArrayWrapper>();
+		current_batch->arrow_array = IGNITION.decode_batch(ignition_job, job_params.start_tuple, request_size);
+		current_batch_idx = 0;
+		job_params.start_tuple += current_batch->arrow_array.length;
+		job_params.tuple_count -= current_batch->arrow_array.length;
+	}
 
-	auto array_wrapper = make_shared_ptr<ArrowArrayWrapper>();
-	array_wrapper->arrow_array = IGNITION.decode_batch(ignition_job, job_params.start_tuple, request_size);
-	auto &array = array_wrapper->arrow_array;
-
-	job_params.start_tuple += array.length;
-	job_params.tuple_count -= array.length;
+	auto &array = current_batch->arrow_array;
+	auto size_to_write = std::min(static_cast<uint64_t>(STANDARD_VECTOR_SIZE), RemainingInBatch());
 
 	D_ASSERT(array.n_children == (int64_t)output.ColumnCount());
 	D_ASSERT(array.release);
@@ -191,24 +205,26 @@ void IgnitionLocalState::ReadBatch(DataChunk &output, const vector<OutputColumnI
 		D_ASSERT(column_array.release);
 		D_ASSERT(column_array.length == array.length);
 
-		SetValidityMask(output.data[idx], column_array);
-		ColumnArrowToDuckDB(output.data[idx], column_array, *arrow_type);
-		output.data[idx].GetBuffer()->SetAuxiliaryData(make_uniq<ArrayHandleAuxiliaryData>(array_wrapper));
+		SetValidityMask(output.data[idx], column_array, current_batch_idx, size_to_write);
+		ColumnArrowToDuckDB(output.data[idx], column_array, *arrow_type, current_batch_idx, size_to_write);
+		output.data[idx].GetBuffer()->SetAuxiliaryData(make_uniq<ArrayHandleAuxiliaryData>(current_batch));
 	}
 
-	output.SetCardinality(array.length);
+	current_batch_idx += size_to_write;
+	output.SetCardinality(size_to_write);
 }
 
 bool IgnitionLocalState::IsFinished() const {
-	return job_params.tuple_count == 0;
+	return RemainingInBatch() == 0 && job_params.tuple_count == 0;
 }
 
 void IgnitionLocalState::SetNewJob(JobParams job_params) {
 	this->job_params = job_params;
 }
 
-void IgnitionLocalState::SetValidityMask(Vector &vector, ArrowArray &array) {
+void IgnitionLocalState::SetValidityMask(Vector &vector, ArrowArray &array, idx_t offset, size_t len) {
 	D_ASSERT(vector.GetVectorType() == VectorType::FLAT_VECTOR);
+	D_ASSERT(offset % 8 == 0);
 	auto &mask = FlatVector::Validity(vector);
 
 	if (array.null_count == 0 || array.n_buffers == 0 || array.buffers[0] == nullptr) {
@@ -216,11 +232,13 @@ void IgnitionLocalState::SetValidityMask(Vector &vector, ArrowArray &array) {
 	}
 
 	mask.EnsureWritable();
-	auto n_bitmask_bytes = (array.length + 8 - 1) / 8;
-	memcpy(mask.GetData(), array.buffers[0], n_bitmask_bytes);
+	auto n_bitmask_bytes = (len + 8 - 1) / 8;
+	const void *src_ptr = static_cast<const uint8_t *>(array.buffers[0]) + offset;
+	memcpy(mask.GetData(), src_ptr, n_bitmask_bytes);
 }
 
-void IgnitionLocalState::ColumnArrowToDuckDB(Vector &vector, ArrowArray &array, const arrow::DataType &arrow_type) {
+void IgnitionLocalState::ColumnArrowToDuckDB(Vector &vector, ArrowArray &array, const arrow::DataType &arrow_type,
+                                             idx_t offset, size_t len) {
 	switch (vector.GetType().id()) {
 	case LogicalTypeId::SQLNULL:
 		vector.Reference(Value {});
@@ -228,11 +246,12 @@ void IgnitionLocalState::ColumnArrowToDuckDB(Vector &vector, ArrowArray &array, 
 	case LogicalTypeId::BOOLEAN: {
 		//! Arrow bit-packs boolean values
 		//! Lets first figure out where we are in the source array
-		auto src_ptr = static_cast<const uint8_t *>(array.buffers[1]);
+		D_ASSERT(offset % 8 == 0);
+		auto src_ptr = static_cast<const uint8_t *>(array.buffers[1]) + offset / 8;
 		auto tgt_ptr = FlatVector::GetData(vector);
 		int src_pos = 0;
 		idx_t cur_bit = 0;
-		for (int64_t row = 0; row < array.length; row++) {
+		for (idx_t row = 0; row < len; row++) {
 			if ((src_ptr[src_pos] & (1 << cur_bit)) == 0) {
 				tgt_ptr[row] = 0;
 			} else {
@@ -263,16 +282,37 @@ void IgnitionLocalState::ColumnArrowToDuckDB(Vector &vector, ArrowArray &array, 
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_NS:
 	case LogicalTypeId::TIME_TZ: {
-		auto data_ptr = const_cast<uint8_t *>(static_cast<const uint8_t *>(array.buffers[1])); // NOLINT
+		auto ptr_offset = offset * arrow_type.byte_width();
+		auto data_ptr = const_cast<uint8_t *>(static_cast<const uint8_t *>(array.buffers[1])) + ptr_offset; // NOLINT
 		FlatVector::SetData(vector, data_ptr);
+		break;
+	}
+	case LogicalTypeId::DATE: {
+		const auto &arrow_date_type = static_cast<const arrow::DateType &>(arrow_type);
+		switch (arrow_date_type.unit()) {
+		case arrow::DateUnit::DAY: {
+			auto ptr_offset = offset * arrow_type.byte_width();
+			auto data_ptr =
+				const_cast<uint8_t *>(static_cast<const uint8_t *>(array.buffers[1])) + ptr_offset; // NOLINT
+			FlatVector::SetData(vector, data_ptr);
+			break;
+		}
+		case arrow::DateUnit::MILLI:
+		default:
+			throw NotImplementedException("Unsupported precision for Date Type ");
+		}
 		break;
 	}
 	case LogicalTypeId::VARCHAR: {
 		switch (arrow_type.id()) {
 		case arrow::Type::STRING: {
 			auto data = static_cast<const char *>(array.buffers[2]);
-			auto offsets = static_cast<const uint32_t *>(array.buffers[1]);
-			SetVectorString(vector, data, offsets, array.length);
+			auto offsets = static_cast<const uint32_t *>(array.buffers[1]) + offset;
+			SetVectorString(vector, data, offsets, len);
+			break;
+		}
+		case arrow::Type::STRING_VIEW: {
+			SetVectorStringView(vector, len, array, offset);
 			break;
 		}
 		default:
@@ -294,6 +334,38 @@ void IgnitionLocalState::SetVectorString(Vector &vector, const char *cdata, cons
 		auto cptr = cdata + offsets[row_idx];
 		auto str_len = offsets[row_idx + 1] - offsets[row_idx];
 		strings[row_idx] = string_t(cptr, str_len);
+	}
+}
+
+void IgnitionLocalState::SetVectorStringView(Vector &vector, idx_t size, ArrowArray &array, idx_t offset) {
+	auto strings = FlatVector::GetData<string_t>(vector);
+	auto arrow_string = static_cast<const arrow_string_view_t *>(array.buffers[1]) + offset;
+
+	for (idx_t row_idx = 0; row_idx < size; row_idx++) {
+		if (FlatVector::IsNull(vector, row_idx)) {
+			continue;
+		}
+		auto length = UnsafeNumericCast<uint32_t>(arrow_string[row_idx].Length());
+		if (arrow_string[row_idx].IsInline()) {
+			//	This string is inlined
+			//  | Bytes 0-3  | Bytes 4-15                            |
+			//  |------------|---------------------------------------|
+			//  | length     | data (padded with 0)                  |
+			strings[row_idx] = string_t(arrow_string[row_idx].GetInlineData(), length);
+		} else {
+			//  This string is not inlined, we have to check a different buffer and offsets
+			//  | Bytes 0-3  | Bytes 4-7  | Bytes 8-11 | Bytes 12-15 |
+			//  |------------|------------|------------|-------------|
+			//  | length     | prefix     | buf. index | offset      |
+			auto buffer_index = UnsafeNumericCast<uint32_t>(arrow_string[row_idx].GetBufferIndex());
+			int32_t str_offset = arrow_string[row_idx].GetOffset();
+			if (array.n_buffers <= 2 + buffer_index) {
+				return;
+			}
+			D_ASSERT(array.n_buffers > 2 + buffer_index);
+			auto c_data = static_cast<const char *>(array.buffers[2 + buffer_index]);
+			strings[row_idx] = string_t(&c_data[str_offset], length);
+		}
 	}
 }
 
