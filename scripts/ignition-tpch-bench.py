@@ -16,15 +16,14 @@ def get_profile_json(q):
         return json.load(file)
 
 
-def find_ignition_entry(profile):
+def sum_ignition_cputime(profile):
+    total = 0
     if "extra_info" in profile and "Function" in profile["extra_info"] and profile["extra_info"]["Function"] == "IGNITION":
-        return profile
+        total += profile["operator_timing"]
     if "children" in profile:
         for child in profile["children"]:
-            rec_res = find_ignition_entry(child)
-            if rec_res:
-                return rec_res
-    return None
+            total += sum_ignition_cputime(child)
+    return total
 
 
 if len(sys.argv) != 6:
@@ -55,7 +54,7 @@ for q in QUERIES:
         os.system(f"cat {sql_file_path} | {duckdb_exe} {tpch_db}")
         profile = get_profile_json(q)
         latency = profile["latency"]
-        ignition_cputime = find_ignition_entry(profile)["operator_timing"]
+        ignition_cputime = sum_ignition_cputime(profile)
         samples[f"{q}"].append([latency, ignition_cputime])
 
 
