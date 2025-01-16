@@ -18,7 +18,7 @@ ignition::Runtime InitRuntime() {
 	auto config_builder = ignition::config::ConfigBuilder::create();
 	config_builder.compile_with_debug(true)
 	    ->set_log_level(ignition::config::LogLevel::Debug)
-		->set_memory_cache_virtual_memory_limit(64UL * 1024 * 1024 * 1024 * 1024)
+	    ->set_memory_cache_virtual_memory_limit(64UL * 1024 * 1024 * 1024 * 1024)
 	    ->set_wasm_cache_limit(64UL * 1024 * 1024);
 	auto config = config_builder.build();
 	return ignition::Runtime::create(std::move(config));
@@ -293,7 +293,7 @@ void IgnitionLocalState::ColumnArrowToDuckDB(Vector &vector, ArrowArray &array, 
 		case arrow::DateUnit::DAY: {
 			auto ptr_offset = offset * arrow_type.byte_width();
 			auto data_ptr =
-				const_cast<uint8_t *>(static_cast<const uint8_t *>(array.buffers[1])) + ptr_offset; // NOLINT
+			    const_cast<uint8_t *>(static_cast<const uint8_t *>(array.buffers[1])) + ptr_offset; // NOLINT
 			FlatVector::SetData(vector, data_ptr);
 			break;
 		}
@@ -315,13 +315,25 @@ void IgnitionLocalState::ColumnArrowToDuckDB(Vector &vector, ArrowArray &array, 
 			SetVectorStringView(vector, len, array, offset);
 			break;
 		}
+		case arrow::Type::FIXED_SIZE_BINARY: {
+			assert(arrow_type.byte_width() == 1);
+			auto data = static_cast<const char *>(array.buffers[1]) + offset;
+			auto strings = FlatVector::GetData<string_t>(vector);
+			for (idx_t row_idx = 0; row_idx < len; row_idx++) {
+				if (FlatVector::IsNull(vector, row_idx)) {
+					continue;
+				}
+				strings[row_idx] = string_t(data + row_idx, 1);
+			}
+			break;
+		}
 		default:
-			throw NotImplementedException("Unsupported Arrow string type in translation.");
+			throw NotImplementedException("Unsupported Arrow string type in translation. " + arrow_type.ToString());
 		}
 		break;
 	}
 	default:
-		throw NotImplementedException("Unsupported LogicalType in translation.");
+		throw NotImplementedException("Unsupported LogicalType in translation. " + arrow_type.ToString());
 	}
 }
 
@@ -359,9 +371,6 @@ void IgnitionLocalState::SetVectorStringView(Vector &vector, idx_t size, ArrowAr
 			//  | length     | prefix     | buf. index | offset      |
 			auto buffer_index = UnsafeNumericCast<uint32_t>(arrow_string[row_idx].GetBufferIndex());
 			int32_t str_offset = arrow_string[row_idx].GetOffset();
-			if (array.n_buffers <= 2 + buffer_index) {
-				return;
-			}
 			D_ASSERT(array.n_buffers > 2 + buffer_index);
 			auto c_data = static_cast<const char *>(array.buffers[2 + buffer_index]);
 			strings[row_idx] = string_t(&c_data[str_offset], length);
@@ -405,8 +414,13 @@ LogicalType TranslateArrowType(const arrow::DataType &data_type) {
 	case arrow::Type::BINARY:
 	case arrow::Type::LARGE_BINARY:
 	case arrow::Type::BINARY_VIEW:
-	case arrow::Type::FIXED_SIZE_BINARY:
 		return LogicalType::BLOB;
+	case arrow::Type::FIXED_SIZE_BINARY:
+		if (data_type.byte_width() == 1) {
+			return LogicalType::VARCHAR;
+		} else {
+			return LogicalType::BLOB;
+		}
 	case arrow::Type::DATE32:
 	case arrow::Type::DATE64:
 		return LogicalType::DATE;
