@@ -71,13 +71,13 @@ create table orders (
     primary key (o_orderkey)
 );
 
-COPY part FROM '../tpch-dbgen/scale1/part.tbl' WITH (DELIMITER '|');
-COPY region FROM '../tpch-dbgen/scale1/region.tbl' WITH (DELIMITER '|');
-COPY nation FROM '../tpch-dbgen/scale1/nation.tbl' WITH (DELIMITER '|');
-COPY supplier FROM '../tpch-dbgen/scale1/supplier.tbl' WITH (DELIMITER '|');
-COPY partsupp FROM '../tpch-dbgen/scale1/partsupp.tbl' WITH (DELIMITER '|');
-COPY customer FROM '../tpch-dbgen/scale1/customer.tbl' WITH (DELIMITER '|');
-COPY orders FROM '../tpch-dbgen/scale1/orders.tbl' WITH (DELIMITER '|');
+COPY part FROM '/home/gienieczko/hdd/tpch-dbgen/part.tbl' WITH (DELIMITER '|');
+COPY region FROM '/home/gienieczko/hdd/tpch-dbgen/region.tbl' WITH (DELIMITER '|');
+COPY nation FROM '/home/gienieczko/hdd/tpch-dbgen/nation.tbl' WITH (DELIMITER '|');
+COPY supplier FROM '/home/gienieczko/hdd/tpch-dbgen/supplier.tbl' WITH (DELIMITER '|');
+COPY partsupp FROM '/home/gienieczko/hdd/tpch-dbgen/partsupp.tbl' WITH (DELIMITER '|');
+COPY customer FROM '/home/gienieczko/hdd/tpch-dbgen/customer.tbl' WITH (DELIMITER '|');
+COPY orders FROM '/home/gienieczko/hdd/tpch-dbgen/orders.tbl' WITH (DELIMITER '|');
 
 CREATE VIEW lineitem AS (
  SELECT
@@ -97,5 +97,5 @@ CREATE VIEW lineitem AS (
  l_shipinstruct,
  l_shipmode,
  l_comment
- FROM ignition('/home/mat/src/portable-decompress/dataset/tpch-vortex.ignition')
+ FROM ignition('/home/gienieczko/src/portable-decompress/dataset/tpch-vortex-s20.ignition')
 );

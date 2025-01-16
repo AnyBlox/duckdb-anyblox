@@ -17,7 +17,7 @@ namespace {
 ignition::Runtime InitRuntime() {
 	auto config_builder = ignition::config::ConfigBuilder::create();
 	config_builder.compile_with_debug(true)
-	    ->set_log_level(ignition::config::LogLevel::Debug)
+	    ->set_log_level(ignition::config::LogLevel::Warn)
 	    ->set_memory_cache_virtual_memory_limit(64UL * 1024 * 1024 * 1024 * 1024)
 	    ->set_wasm_cache_limit(64UL * 1024 * 1024);
 	auto config = config_builder.build();
