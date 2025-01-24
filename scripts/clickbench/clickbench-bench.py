@@ -16,13 +16,15 @@ def get_profile_json(q):
         return json.load(file)
 
 
-def sum_ignition_cputime(profile):
+def sum_scan_cputime(profile):
     total = 0
-    if "extra_info" in profile and "Function" in profile["extra_info"] and profile["extra_info"]["Function"] == "IGNITION":
+    if "operator_type" in profile and profile["operator_type"] == "TABLE_SCAN":
+      if ("Function" in profile["extra_info"] and profile["extra_info"]["Function"] in ["IGNITION", "PARQUET_SCAN"])\
+         or ("Text" in profile["extra_info"] and profile["extra_info"]["Text"] in ["hits_strings_0", "hits_strings_1", "hits_strings_2", "hits_strings_3"]):
         total += profile["operator_timing"]
     if "children" in profile:
         for child in profile["children"]:
-            total += sum_ignition_cputime(child)
+            total += sum_scan_cputime(child)
     return total
 
 
@@ -37,6 +39,7 @@ threads = int(sys.argv[4])
 out_dir = sys.argv[5]
 
 os.system(f"mkdir -p {TMP_DIR}")
+os.system(f"mkdir -p {out_dir}")
 
 samples = {}
 
@@ -54,8 +57,8 @@ for q in QUERIES:
         os.system(f"cat {sql_file_path} | {duckdb_exe} {clickbench_db}")
         profile = get_profile_json(q)
         latency = profile["latency"]
-        ignition_cputime = sum_ignition_cputime(profile)
-        samples[f"{q}"].append([latency, ignition_cputime])
+        scan_cputime = sum_scan_cputime(profile)
+        samples[f"{q}"].append([latency, scan_cputime])
 
 
 with open(f"{out_dir}/clickbench-t{threads}-results.json", 'w') as file:
