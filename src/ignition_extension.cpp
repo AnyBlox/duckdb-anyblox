@@ -14,16 +14,56 @@
 
 namespace duckdb {
 namespace {
-ignition::Runtime InitRuntime() {
-	auto config_builder = ignition::config::ConfigBuilder::create();
-	config_builder.compile_with_debug(true)
-	    ->set_log_level(ignition::config::LogLevel::Warn)
-	    ->set_memory_cache_virtual_memory_limit(64UL * 1024 * 1024 * 1024 * 1024)
-	    ->set_wasm_cache_limit(64UL * 1024 * 1024);
-	auto config = config_builder.build();
-	return ignition::Runtime::create(std::move(config));
+const char *const CONFIG_WASM_VIRTUAL_MEMORY_LIMIT = "wasm_virtual_memory_limit";
+const char *const CONFIG_WASM_CACHE_LIMIT = "wasm_cache_limit";
+const char *const CONFIG_COMPILE_WITH_DEBUG = "compile_wasm_with_debug";
+const char *const CONFIG_VALIDATE_UTF8 = "validate_utf8";
+const int64_t DEFAULT_VIRTUAL_MEMORY_LIMIT = 64L * 1024 * 1024 * 1024 * 1024;
+const int64_t DEFAULT_WASM_CACHE_LIMIT = 256L * 1024 * 1024;
+
+class IgnitionRuntime {
+public:
+	[[nodiscard]] static ignition::Runtime &Get();
+	static ignition::Runtime &GetOrInit(ClientContext &context_p);
+
+private:
+	static mutex runtime_mutex;
+	static std::optional<ignition::Runtime> IGNITION;
+};
+
+constinit mutex IgnitionRuntime::runtime_mutex {};
+constinit std::optional<ignition::Runtime> IgnitionRuntime::IGNITION {};
+
+ignition::Runtime &IgnitionRuntime::Get() {
+	return IGNITION.value();
 }
-ignition::Runtime IGNITION = InitRuntime();
+ignition::Runtime &IgnitionRuntime::GetOrInit(ClientContext &context_p) {
+	if (IGNITION.has_value()) {
+		return IGNITION.value();
+	} else {
+		Value compile_with_debug {false}, virtual_memory_limit {DEFAULT_VIRTUAL_MEMORY_LIMIT},
+		    wasm_cache_limit {DEFAULT_WASM_CACHE_LIMIT};
+		context_p.TryGetCurrentSetting(CONFIG_COMPILE_WITH_DEBUG, compile_with_debug);
+		context_p.TryGetCurrentSetting(CONFIG_WASM_VIRTUAL_MEMORY_LIMIT, virtual_memory_limit);
+		context_p.TryGetCurrentSetting(CONFIG_WASM_CACHE_LIMIT, wasm_cache_limit);
+
+		auto config_builder = ignition::config::ConfigBuilder::create();
+		config_builder.compile_with_debug(compile_with_debug.GetValue<bool>())
+		    ->set_log_level(ignition::config::LogLevel::Warn)
+		    ->set_memory_cache_virtual_memory_limit(virtual_memory_limit.GetValue<uint64_t>())
+		    ->set_wasm_cache_limit(wasm_cache_limit.GetValue<uint64_t>());
+		auto config = config_builder.build();
+		{
+			lock_guard<mutex> parallel_lock {runtime_mutex};
+			if (IGNITION.has_value()) {
+				return IGNITION.value();
+			} else {
+				IGNITION = ignition::Runtime::create(std::move(config));
+				return IGNITION.value();
+			}
+		}
+	}
+}
 
 class IgnitionFunctionData : public FunctionData {
 public:
@@ -147,10 +187,8 @@ private:
 
 class IgnitionLocalState : public LocalTableFunctionState {
 public:
-	explicit IgnitionLocalState(const ignition::IgnitionBundle &bundle, ignition::ColumnProjection column_projection)
-	    : ignition_job(std::move(IGNITION.decode_job_init(bundle, column_projection)).ValueOrDie()),
-	      current_batch(nullptr), job_params(JobParams {.start_tuple = 0, .tuple_count = 0}) {
-	}
+	explicit IgnitionLocalState(const ClientContext &context, const ignition::IgnitionBundle &bundle,
+	                            ignition::ColumnProjection column_projection);
 
 	void ReadBatch(DataChunk &output, const vector<OutputColumnId> &output_column_ids);
 	bool IsFinished() const;
@@ -161,6 +199,10 @@ private:
 	shared_ptr<ArrowArrayWrapper> current_batch;
 	idx_t current_batch_idx = 0;
 	JobParams job_params;
+
+	static std::unique_ptr<ignition::ThreadLocalDecodeJob>
+	InitIgnitionJob(const ClientContext &context, const ignition::IgnitionBundle &bundle,
+	                ignition::ColumnProjection column_projection);
 
 	uint64_t RemainingInBatch() const {
 		return current_batch == nullptr ? 0 : current_batch->arrow_array.length - current_batch_idx;
@@ -183,11 +225,31 @@ private:
 	};
 };
 
+IgnitionLocalState::IgnitionLocalState(const ClientContext &context, const ignition::IgnitionBundle &bundle,
+                                       ignition::ColumnProjection column_projection)
+    : ignition_job(InitIgnitionJob(context, bundle, column_projection)), current_batch(nullptr),
+      job_params(JobParams {.start_tuple = 0, .tuple_count = 0}) {
+}
+
+std::unique_ptr<ignition::ThreadLocalDecodeJob>
+IgnitionLocalState::InitIgnitionJob(const ClientContext &context, const ignition::IgnitionBundle &bundle,
+                                    ignition::ColumnProjection column_projection) {
+	Value validate_utf8 {true};
+	context.TryGetCurrentSetting(CONFIG_VALIDATE_UTF8, validate_utf8);
+	auto builder = ignition::JobParameterBuilder {};
+	if (!validate_utf8.GetValue<bool>()) {
+		builder.do_not_validate_utf8();
+	}
+	ignition::JobParameters params = builder.with_column_projection(column_projection).finish(bundle);
+	return IgnitionRuntime::Get().decode_job_init(params).ValueOrDie();
+}
+
 void IgnitionLocalState::ReadBatch(DataChunk &output, const vector<OutputColumnId> &output_column_ids) {
 	if (RemainingInBatch() == 0) {
 		auto request_size = std::min(static_cast<uint64_t>(STANDARD_VECTOR_SIZE) * 50, job_params.tuple_count);
 		current_batch = make_shared_ptr<ArrowArrayWrapper>();
-		current_batch->arrow_array = IGNITION.decode_batch(ignition_job, job_params.start_tuple, request_size);
+		current_batch->arrow_array =
+		    IgnitionRuntime::Get().decode_batch(ignition_job, job_params.start_tuple, request_size);
 		current_batch_idx = 0;
 		job_params.start_tuple += current_batch->arrow_array.length;
 		job_params.tuple_count -= current_batch->arrow_array.length;
@@ -494,8 +556,9 @@ void IgnitionFunction(ClientContext & /* context */, TableFunctionInput &data, D
 	local_state.ReadBatch(output, global_state.GetOutputColumnIds());
 }
 
-unique_ptr<FunctionData> IgnitionBind(ClientContext & /* context */, TableFunctionBindInput &input,
+unique_ptr<FunctionData> IgnitionBind(ClientContext &context, TableFunctionBindInput &input,
                                       vector<LogicalType> &logicals, vector<string> &names) {
+	IgnitionRuntime::GetOrInit(context);
 	assert(input.inputs.size() == 1);
 	auto ignition_path = input.inputs.front().GetValue<std::string>();
 	auto data_path_iter = input.named_parameters.find("data");
@@ -525,11 +588,11 @@ unique_ptr<GlobalTableFunctionState> IgnitionGlobalInit(ClientContext &context, 
 	                                      max_threads);
 }
 
-unique_ptr<LocalTableFunctionState> IgnitionLocalInit(ExecutionContext & /* context */,
-                                                      TableFunctionInitInput & /* input */,
+unique_ptr<LocalTableFunctionState> IgnitionLocalInit(ExecutionContext &context, TableFunctionInitInput & /* input */,
                                                       GlobalTableFunctionState *global_state) {
 	auto &ignition_state = global_state->Cast<IgnitionGlobalState>();
-	return make_uniq<IgnitionLocalState>(ignition_state.GetBundle(), ignition_state.GetColumnProjection());
+	return make_uniq<IgnitionLocalState>(context.client, ignition_state.GetBundle(),
+	                                     ignition_state.GetColumnProjection());
 }
 
 unique_ptr<NodeStatistics> IgnitionCardinality(ClientContext & /* context */, const FunctionData *bind_data) {
@@ -564,6 +627,20 @@ static void LoadInternal(DatabaseInstance &instance) {
 	ignition_table_function.cardinality = IgnitionCardinality;
 	ignition_table_function.statistics = IgnitionStatistics;
 	ExtensionUtil::RegisterFunction(instance, ignition_table_function);
+
+	auto &config = DBConfig::GetConfig(instance);
+	config.AddExtensionOption(CONFIG_WASM_VIRTUAL_MEMORY_LIMIT,
+	                          "Upper limit for all virtual allocations performed by the wasm runtime",
+	                          LogicalTypeId::BIGINT, Value(DEFAULT_VIRTUAL_MEMORY_LIMIT));
+	config.AddExtensionOption(CONFIG_WASM_CACHE_LIMIT, "Upper limit for the wasm compiled decoder cache",
+	                          LogicalTypeId::BIGINT, Value(DEFAULT_WASM_CACHE_LIMIT));
+	config.AddExtensionOption(CONFIG_COMPILE_WITH_DEBUG, "Whether to compile wasm decoders with debuginfo",
+	                          LogicalTypeId::BOOLEAN, Value(false));
+	config.AddExtensionOption(
+	    CONFIG_VALIDATE_UTF8,
+	    "Whether to check string columns returned from decoders are valid UTF8. WARNING: disabling this is unsafe, "
+	    "untrusted wasm decoders can cause memory security vulnerabilities with invalid strings.",
+	    LogicalTypeId::BOOLEAN, Value(true));
 }
 
 void IgnitionExtension::Load(DuckDB &db) {

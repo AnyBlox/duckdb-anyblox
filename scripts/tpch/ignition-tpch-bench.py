@@ -29,12 +29,12 @@ def sum_scan_cputime(profile):
 
 
 if len(sys.argv) != 6:
-    print(f"Usage: {sys.argv[0]} DUCKDB_EXE TPCH_DB SCRIPTS_DIR THREADS OUT_DIR")
+    print(f"Usage: {sys.argv[0]} DUCKDB_EXE TPCH_DB QUERIES_DIR THREADS OUT_DIR")
     exit(1)
 
 duckdb_exe = sys.argv[1]
 tpch_db = sys.argv[2]
-scripts_dir = sys.argv[3]
+queries_dir = sys.argv[3]
 threads = int(sys.argv[4])
 out_dir = sys.argv[5]
 
@@ -44,7 +44,7 @@ os.system(f"mkdir -p {out_dir}")
 samples = {}
 
 for q in QUERIES:
-    input_file = f"{scripts_dir}/tpch-q{q}.sql"
+    input_file = f"{queries_dir}/tpch-q{q}.sql"
     sql_file_path = f"{TMP_DIR}/input_q{q}.sql"
     os.system(f"cat {input_file} {input_file} {input_file} {input_file} {input_file} > {sql_file_path}")
     os.system(f"echo \"SET threads = {threads};\n\" >> {sql_file_path}")

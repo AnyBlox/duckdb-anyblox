@@ -1,0 +1,4 @@
+COPY (SELECT rid, SearchPhrase, MobilePhoneModel, URL, Title, Referer FROM hits WHERE rid <= 25067520) TO '/home/gienieczko/hdd/hits-strings-0.parquet' (FORMAT 'parquet', ROW_GROUP_SIZE 122880);
+COPY (SELECT rid, SearchPhrase, MobilePhoneModel, URL, Title, Referer FROM hits WHERE rid > 25067520 AND rid <= 50135040) TO '/home/gienieczko/hdd/hits-strings-1.parquet' (FORMAT 'parquet', ROW_GROUP_SIZE 122880);
+COPY (SELECT rid, SearchPhrase, MobilePhoneModel, URL, Title, Referer FROM hits WHERE rid > 50135040 AND rid <= 75202560) TO '/home/gienieczko/hdd/hits-strings-2.parquet' (FORMAT 'parquet', ROW_GROUP_SIZE 122880);
+COPY (SELECT rid, SearchPhrase, MobilePhoneModel, URL, Title, Referer FROM hits WHERE rid > 75202560) TO '/home/gienieczko/hdd/hits-strings-3.parquet' (FORMAT 'parquet', ROW_GROUP_SIZE 122880);
