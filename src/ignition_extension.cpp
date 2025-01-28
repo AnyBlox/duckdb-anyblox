@@ -11,6 +11,7 @@
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include <fmt/core.h>
 #include <ignition/ignition.hpp>
+#include <shared_mutex>
 
 namespace duckdb {
 namespace {
@@ -82,9 +83,15 @@ public:
 	}
 
 	shared_ptr<ignition::IgnitionBundle> OpenBundle() const {
-		lock_guard<mutex> parallel_lock {cache_mutex};
+		std::shared_lock r_lock{cache_mutex};
 		auto it = bundle_cache.find(ignition_path);
 		if (it == bundle_cache.end()) {
+			r_lock.unlock();
+			std::unique_lock w_lock{cache_mutex};
+			it = bundle_cache.find(ignition_path);
+			if (it != bundle_cache.end()) {
+				return it->second;
+			}
 			auto bundle = data_path.has_value()
 				   ? ignition::IgnitionBundle::open_extension_and_data(ignition_path, data_path.value())
 				   : ignition::IgnitionBundle::open_self_contained(ignition_path);
@@ -109,10 +116,10 @@ private:
 	std::optional<std::string> data_path;
 	ignition::IgnitionMetadata metadata;
 
-	static mutex cache_mutex;
+	static std::shared_mutex cache_mutex;
 	static unordered_map<string, shared_ptr<ignition::IgnitionBundle>> bundle_cache;
 };
-mutex IgnitionFunctionData::cache_mutex {};
+std::shared_mutex IgnitionFunctionData::cache_mutex {};
 unordered_map<string, shared_ptr<ignition::IgnitionBundle>> IgnitionFunctionData::bundle_cache {};
 
 struct JobParams {
