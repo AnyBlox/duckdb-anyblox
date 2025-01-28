@@ -81,10 +81,19 @@ public:
 		return ignition_path == other_data.ignition_path && data_path == other_data.data_path;
 	}
 
-	ignition::IgnitionBundle OpenBundle() const {
-		return data_path.has_value()
-		           ? ignition::IgnitionBundle::open_extension_and_data(ignition_path, data_path.value())
-		           : ignition::IgnitionBundle::open_self_contained(ignition_path);
+	shared_ptr<ignition::IgnitionBundle> OpenBundle() const {
+		lock_guard<mutex> parallel_lock {cache_mutex};
+		auto it = bundle_cache.find(ignition_path);
+		if (it == bundle_cache.end()) {
+			auto bundle = data_path.has_value()
+				   ? ignition::IgnitionBundle::open_extension_and_data(ignition_path, data_path.value())
+				   : ignition::IgnitionBundle::open_self_contained(ignition_path);
+			auto ptr = make_shared_ptr<ignition::IgnitionBundle>(std::move(bundle));
+			bundle_cache[ignition_path] = ptr;
+			return ptr;
+		} else {
+			return it->second;
+		}
 	}
 
 	const ignition::IgnitionMetadata &GetMetadata() const {
@@ -99,7 +108,12 @@ private:
 	std::string ignition_path;
 	std::optional<std::string> data_path;
 	ignition::IgnitionMetadata metadata;
+
+	static mutex cache_mutex;
+	static unordered_map<string, shared_ptr<ignition::IgnitionBundle>> bundle_cache;
 };
+mutex IgnitionFunctionData::cache_mutex {};
+unordered_map<string, shared_ptr<ignition::IgnitionBundle>> IgnitionFunctionData::bundle_cache {};
 
 struct JobParams {
 	uint64_t start_tuple;
@@ -113,10 +127,10 @@ struct OutputColumnId {
 
 class IgnitionGlobalState : public GlobalTableFunctionState {
 public:
-	IgnitionGlobalState(ignition::IgnitionBundle bundle, std::shared_ptr<arrow::Schema> schema,
+	IgnitionGlobalState(shared_ptr<ignition::IgnitionBundle> bundle, std::shared_ptr<arrow::Schema> schema,
 	                    vector<column_t> column_ids, uint64_t max_threads)
 	    : bundle(std::move(bundle)), schema(std::move(schema)) {
-		row_count = this->bundle.metadata().data.count;
+		row_count = this->bundle->metadata().data.count;
 		rows_per_job = std::max(row_count / max_threads, MIN_JOB_SIZE);
 		uint64_t actual_max_threads = (row_count + rows_per_job - 1) / rows_per_job;
 		this->max_threads = actual_max_threads;
@@ -137,7 +151,7 @@ public:
 	}
 
 	const ignition::IgnitionBundle &GetBundle() const {
-		return bundle;
+		return *bundle;
 	}
 
 	const ignition::ColumnProjection &GetColumnProjection() const {
@@ -174,7 +188,7 @@ private:
 
 	mutable mutex main_mutex;
 
-	ignition::IgnitionBundle bundle;
+	shared_ptr<ignition::IgnitionBundle> bundle;
 	std::shared_ptr<arrow::Schema> schema;
 	ignition::ColumnProjection projection;
 	vector<OutputColumnId> output_column_ids;

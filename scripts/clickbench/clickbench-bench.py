@@ -19,7 +19,7 @@ def get_profile_json(q):
 def sum_scan_cputime(profile):
     total = 0
     if "operator_type" in profile and profile["operator_type"] == "TABLE_SCAN":
-      if ("Function" in profile["extra_info"] and profile["extra_info"]["Function"] in ["IGNITION", "PARQUET_SCAN"])\
+      if ("Function" in profile["extra_info"] and profile["extra_info"]["Function"] in ["IGNITION", "PARQUET_SCAN", "READ_PARQUET"])\
          or ("Text" in profile["extra_info"] and profile["extra_info"]["Text"] in ["hits_strings_0", "hits_strings_1", "hits_strings_2", "hits_strings_3"]):
         total += profile["operator_timing"]
     if "children" in profile:
