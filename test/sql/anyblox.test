@@ -1,0 +1,23 @@
+# name: test/sql/anyblox.test
+# description: test anyblox extension
+# group: [anyblox]
+
+# Before we load the extension, this will fail
+statement error
+SELECT anyblox('Sam');
+----
+Catalog Error: Scalar Function with name anyblox does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require anyblox
+
+# Confirm the extension works
+query I
+SELECT anyblox('Sam');
+----
+AnyBlox Sam 🐥
+
+query I
+SELECT anyblox_openssl_version('Michael') ILIKE 'AnyBlox Michael, my linked OpenSSL version is OpenSSL%';
+----
+true

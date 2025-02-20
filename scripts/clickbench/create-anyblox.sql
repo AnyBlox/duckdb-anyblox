@@ -106,13 +106,13 @@ CREATE TABLE hits_base
 COPY hits_base FROM '/home/gienieczko/hdd/data/ClickBench/hits-base.parquet';
 
 CREATE VIEW hits_strings AS (
-  SELECT * FROM ignition('/home/gienieczko/data/ClickBench/hits-strings-0.ignition')
+  SELECT * FROM anyblox('/home/gienieczko/data/ClickBench/hits-strings-0.any')
   UNION ALL
-  SELECT * FROM ignition('/home/gienieczko/data/ClickBench/hits-strings-1.ignition')
+  SELECT * FROM anyblox('/home/gienieczko/data/ClickBench/hits-strings-1.any')
   UNION ALL
-  SELECT * FROM ignition('/home/gienieczko/data/ClickBench/hits-strings-2.ignition')
+  SELECT * FROM anyblox('/home/gienieczko/data/ClickBench/hits-strings-2.any')
   UNION ALL
-  SELECT * FROM ignition('/home/gienieczko/data/ClickBench/hits-strings-3.ignition')
+  SELECT * FROM anyblox('/home/gienieczko/data/ClickBench/hits-strings-3.any')
 );
 
 CREATE VIEW hits AS (

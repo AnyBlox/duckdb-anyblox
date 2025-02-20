@@ -97,5 +97,5 @@ CREATE VIEW lineitem AS (
  l_shipinstruct,
  l_shipmode,
  l_comment
- FROM ignition('/home/gienieczko/src/portable-decompress/dataset/tpch-vortex-s20.ignition')
+ FROM anyblox('/home/gienieczko/src/portable-decompress/dataset/tpch-vortex-s20.any')
 );

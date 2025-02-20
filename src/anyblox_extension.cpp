@@ -1,6 +1,6 @@
 #define DUCKDB_EXTENSION_MAIN
 
-#include "ignition_extension.hpp"
+#include "anyblox_extension.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -10,7 +10,7 @@
 #include <duckdb/common/types/arrow_string_view_type.hpp>
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include <fmt/core.h>
-#include <ignition/ignition.hpp>
+#include <anyblox/anyblox.hpp>
 #include <shared_mutex>
 
 namespace duckdb {
@@ -19,28 +19,28 @@ const char *const CONFIG_WASM_VIRTUAL_MEMORY_LIMIT = "wasm_virtual_memory_limit"
 const char *const CONFIG_WASM_CACHE_LIMIT = "wasm_cache_limit";
 const char *const CONFIG_COMPILE_WITH_DEBUG = "compile_wasm_with_debug";
 const char *const CONFIG_VALIDATE_UTF8 = "validate_utf8";
-const int64_t DEFAULT_VIRTUAL_MEMORY_LIMIT = 64L * 1024 * 1024 * 1024 * 1024;
+const int64_t DEFAULT_VIRTUAL_MEMORY_LIMIT = 16L * 1024 * 1024 * 1024;
 const int64_t DEFAULT_WASM_CACHE_LIMIT = 256L * 1024 * 1024;
 
-class IgnitionRuntime {
+class AnyBloxRuntime {
 public:
-	[[nodiscard]] static ignition::Runtime &Get();
-	static ignition::Runtime &GetOrInit(ClientContext &context_p);
+	[[nodiscard]] static anyblox::Runtime &Get();
+	static anyblox::Runtime &GetOrInit(ClientContext &context_p);
 
 private:
 	static mutex runtime_mutex;
-	static std::optional<ignition::Runtime> IGNITION;
+	static std::optional<anyblox::Runtime> ANYBLOX;
 };
 
-constinit mutex IgnitionRuntime::runtime_mutex {};
-constinit std::optional<ignition::Runtime> IgnitionRuntime::IGNITION {};
+constinit mutex AnyBloxRuntime::runtime_mutex {};
+constinit std::optional<anyblox::Runtime> AnyBloxRuntime::ANYBLOX {};
 
-ignition::Runtime &IgnitionRuntime::Get() {
-	return IGNITION.value();
+anyblox::Runtime &AnyBloxRuntime::Get() {
+	return ANYBLOX.value();
 }
-ignition::Runtime &IgnitionRuntime::GetOrInit(ClientContext &context_p) {
-	if (IGNITION.has_value()) {
-		return IGNITION.value();
+anyblox::Runtime &AnyBloxRuntime::GetOrInit(ClientContext &context_p) {
+	if (ANYBLOX.has_value()) {
+		return ANYBLOX.value();
 	} else {
 		Value compile_with_debug {false}, virtual_memory_limit {DEFAULT_VIRTUAL_MEMORY_LIMIT},
 		    wasm_cache_limit {DEFAULT_WASM_CACHE_LIMIT};
@@ -48,62 +48,62 @@ ignition::Runtime &IgnitionRuntime::GetOrInit(ClientContext &context_p) {
 		context_p.TryGetCurrentSetting(CONFIG_WASM_VIRTUAL_MEMORY_LIMIT, virtual_memory_limit);
 		context_p.TryGetCurrentSetting(CONFIG_WASM_CACHE_LIMIT, wasm_cache_limit);
 
-		auto config_builder = ignition::config::ConfigBuilder::create();
+		auto config_builder = anyblox::config::ConfigBuilder::create();
 		config_builder.compile_with_debug(compile_with_debug.GetValue<bool>())
-		    ->set_log_level(ignition::config::LogLevel::Warn)
-		    ->set_memory_cache_virtual_memory_limit(virtual_memory_limit.GetValue<uint64_t>())
+		    ->set_log_level(anyblox::config::LogLevel::Warn)
+		    ->set_thread_virtual_memory_limit(virtual_memory_limit.GetValue<uint64_t>())
 		    ->set_wasm_cache_limit(wasm_cache_limit.GetValue<uint64_t>());
 		auto config = config_builder.build();
 		{
 			lock_guard<mutex> parallel_lock {runtime_mutex};
-			if (IGNITION.has_value()) {
-				return IGNITION.value();
+			if (ANYBLOX.has_value()) {
+				return ANYBLOX.value();
 			} else {
-				IGNITION = ignition::Runtime::create(std::move(config));
-				return IGNITION.value();
+				ANYBLOX = anyblox::Runtime::create(std::move(config));
+				return ANYBLOX.value();
 			}
 		}
 	}
 }
 
-class IgnitionFunctionData : public FunctionData {
+class AnyBloxFunctionData : public FunctionData {
 public:
-	explicit IgnitionFunctionData(std::string ignition_path, std::optional<std::string> data_path,
-	                              ignition::IgnitionMetadata metadata)
-	    : ignition_path(std::move(ignition_path)), data_path(std::move(data_path)), metadata(std::move(metadata)) {
+	explicit AnyBloxFunctionData(std::string anyblox_path, std::optional<std::string> data_path,
+	                              anyblox::AnyBloxMetadata metadata)
+	    : anyblox_path(std::move(anyblox_path)), data_path(std::move(data_path)), metadata(std::move(metadata)) {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<IgnitionFunctionData>(*this);
+		return make_uniq<AnyBloxFunctionData>(*this);
 	}
 
 	bool Equals(const FunctionData &other) const override {
-		const auto &other_data = other.Cast<IgnitionFunctionData>();
-		return ignition_path == other_data.ignition_path && data_path == other_data.data_path;
+		const auto &other_data = other.Cast<AnyBloxFunctionData>();
+		return anyblox_path == other_data.anyblox_path && data_path == other_data.data_path;
 	}
 
-	shared_ptr<ignition::IgnitionBundle> OpenBundle() const {
+	shared_ptr<anyblox::AnyBloxBundle> OpenBundle() const {
 		std::shared_lock r_lock{cache_mutex};
-		auto it = bundle_cache.find(ignition_path);
+		auto it = bundle_cache.find(anyblox_path);
 		if (it == bundle_cache.end()) {
 			r_lock.unlock();
 			std::unique_lock w_lock{cache_mutex};
-			it = bundle_cache.find(ignition_path);
+			it = bundle_cache.find(anyblox_path);
 			if (it != bundle_cache.end()) {
 				return it->second;
 			}
 			auto bundle = data_path.has_value()
-				   ? ignition::IgnitionBundle::open_extension_and_data(ignition_path, data_path.value())
-				   : ignition::IgnitionBundle::open_self_contained(ignition_path);
-			auto ptr = make_shared_ptr<ignition::IgnitionBundle>(std::move(bundle));
-			bundle_cache[ignition_path] = ptr;
+				   ? anyblox::AnyBloxBundle::open_extension_and_data(anyblox_path, data_path.value())
+				   : anyblox::AnyBloxBundle::open_self_contained(anyblox_path);
+			auto ptr = make_shared_ptr<anyblox::AnyBloxBundle>(std::move(bundle));
+			bundle_cache[anyblox_path] = ptr;
 			return ptr;
 		} else {
 			return it->second;
 		}
 	}
 
-	const ignition::IgnitionMetadata &GetMetadata() const {
+	const anyblox::AnyBloxMetadata &GetMetadata() const {
 		return metadata;
 	}
 
@@ -112,15 +112,15 @@ public:
 	}
 
 private:
-	std::string ignition_path;
+	std::string anyblox_path;
 	std::optional<std::string> data_path;
-	ignition::IgnitionMetadata metadata;
+	anyblox::AnyBloxMetadata metadata;
 
 	static std::shared_mutex cache_mutex;
-	static unordered_map<string, shared_ptr<ignition::IgnitionBundle>> bundle_cache;
+	static unordered_map<string, shared_ptr<anyblox::AnyBloxBundle>> bundle_cache;
 };
-std::shared_mutex IgnitionFunctionData::cache_mutex {};
-unordered_map<string, shared_ptr<ignition::IgnitionBundle>> IgnitionFunctionData::bundle_cache {};
+std::shared_mutex AnyBloxFunctionData::cache_mutex {};
+unordered_map<string, shared_ptr<anyblox::AnyBloxBundle>> AnyBloxFunctionData::bundle_cache {};
 
 struct JobParams {
 	uint64_t start_tuple;
@@ -132,9 +132,9 @@ struct OutputColumnId {
 	idx_t idx_in_schema;
 };
 
-class IgnitionGlobalState : public GlobalTableFunctionState {
+class AnyBloxGlobalState : public GlobalTableFunctionState {
 public:
-	IgnitionGlobalState(shared_ptr<ignition::IgnitionBundle> bundle, std::shared_ptr<arrow::Schema> schema,
+	AnyBloxGlobalState(shared_ptr<anyblox::AnyBloxBundle> bundle, std::shared_ptr<arrow::Schema> schema,
 	                    vector<column_t> column_ids, uint64_t max_threads)
 	    : bundle(std::move(bundle)), schema(std::move(schema)) {
 		row_count = this->bundle->metadata().data.count;
@@ -143,7 +143,7 @@ public:
 		this->max_threads = actual_max_threads;
 		this->next_job_start = 0;
 
-		projection = ignition::ColumnProjection::from_indices(column_ids.begin(), column_ids.end());
+		projection = anyblox::ColumnProjection::from_indices(column_ids.begin(), column_ids.end());
 		vector<std::pair<column_t, idx_t>> column_projection {};
 		column_projection.reserve(column_ids.size());
 		for (idx_t i = 0, limit = column_ids.size(); i < limit; i += 1) {
@@ -157,11 +157,11 @@ public:
 		}
 	}
 
-	const ignition::IgnitionBundle &GetBundle() const {
+	const anyblox::AnyBloxBundle &GetBundle() const {
 		return *bundle;
 	}
 
-	const ignition::ColumnProjection &GetColumnProjection() const {
+	const anyblox::ColumnProjection &GetColumnProjection() const {
 		return projection;
 	}
 
@@ -195,9 +195,9 @@ private:
 
 	mutable mutex main_mutex;
 
-	shared_ptr<ignition::IgnitionBundle> bundle;
+	shared_ptr<anyblox::AnyBloxBundle> bundle;
 	std::shared_ptr<arrow::Schema> schema;
-	ignition::ColumnProjection projection;
+	anyblox::ColumnProjection projection;
 	vector<OutputColumnId> output_column_ids;
 
 	uint64_t max_threads;
@@ -206,24 +206,25 @@ private:
 	uint64_t rows_per_job;
 };
 
-class IgnitionLocalState : public LocalTableFunctionState {
+class AnyBloxLocalState : public LocalTableFunctionState {
 public:
-	explicit IgnitionLocalState(const ClientContext &context, const ignition::IgnitionBundle &bundle,
-	                            ignition::ColumnProjection column_projection);
+	explicit AnyBloxLocalState(const ClientContext &context, const anyblox::AnyBloxBundle &bundle,
+	                            anyblox::ColumnProjection column_projection);
 
 	void ReadBatch(DataChunk &output, const vector<OutputColumnId> &output_column_ids);
 	bool IsFinished() const;
 	void SetNewJob(JobParams job_params);
 
 private:
-	std::unique_ptr<ignition::ThreadLocalDecodeJob> ignition_job;
+	std::unique_ptr<anyblox::ThreadLocalDecodeJob> anyblox_job;
 	shared_ptr<ArrowArrayWrapper> current_batch;
 	idx_t current_batch_idx = 0;
 	JobParams job_params;
+	uint64_t batch_size;
 
-	static std::unique_ptr<ignition::ThreadLocalDecodeJob>
-	InitIgnitionJob(const ClientContext &context, const ignition::IgnitionBundle &bundle,
-	                ignition::ColumnProjection column_projection);
+	static std::unique_ptr<anyblox::ThreadLocalDecodeJob>
+	InitAnyBloxJob(const ClientContext &context, const anyblox::AnyBloxBundle &bundle,
+	                anyblox::ColumnProjection column_projection);
 
 	uint64_t RemainingInBatch() const {
 		return current_batch == nullptr ? 0 : current_batch->arrow_array.length - current_batch_idx;
@@ -246,31 +247,36 @@ private:
 	};
 };
 
-IgnitionLocalState::IgnitionLocalState(const ClientContext &context, const ignition::IgnitionBundle &bundle,
-                                       ignition::ColumnProjection column_projection)
-    : ignition_job(InitIgnitionJob(context, bundle, column_projection)), current_batch(nullptr),
+AnyBloxLocalState::AnyBloxLocalState(const ClientContext &context, const anyblox::AnyBloxBundle &bundle,
+                                       anyblox::ColumnProjection column_projection)
+    : anyblox_job(InitAnyBloxJob(context, bundle, column_projection)), current_batch(nullptr),
       job_params(JobParams {.start_tuple = 0, .tuple_count = 0}) {
+	batch_size = static_cast<uint64_t>(STANDARD_VECTOR_SIZE) * 16;
+	auto min_batch_size = bundle.metadata().decoder.min_batch_size;
+	if (min_batch_size) {
+		batch_size = std::max(min_batch_size.value(), batch_size);
+	}
 }
 
-std::unique_ptr<ignition::ThreadLocalDecodeJob>
-IgnitionLocalState::InitIgnitionJob(const ClientContext &context, const ignition::IgnitionBundle &bundle,
-                                    ignition::ColumnProjection column_projection) {
+std::unique_ptr<anyblox::ThreadLocalDecodeJob>
+AnyBloxLocalState::InitAnyBloxJob(const ClientContext &context, const anyblox::AnyBloxBundle &bundle,
+                                    anyblox::ColumnProjection column_projection) {
 	Value validate_utf8 {true};
 	context.TryGetCurrentSetting(CONFIG_VALIDATE_UTF8, validate_utf8);
-	auto builder = ignition::JobParameterBuilder {};
+	auto builder = anyblox::JobParameterBuilder {};
 	if (!validate_utf8.GetValue<bool>()) {
 		builder.do_not_validate_utf8();
 	}
-	ignition::JobParameters params = builder.with_column_projection(column_projection).finish(bundle);
-	return IgnitionRuntime::Get().decode_job_init(params).ValueOrDie();
+	anyblox::JobParameters params = builder.with_column_projection(column_projection).finish(bundle);
+	return AnyBloxRuntime::Get().decode_job_init(params).ValueOrDie();
 }
 
-void IgnitionLocalState::ReadBatch(DataChunk &output, const vector<OutputColumnId> &output_column_ids) {
+void AnyBloxLocalState::ReadBatch(DataChunk &output, const vector<OutputColumnId> &output_column_ids) {
 	if (RemainingInBatch() == 0) {
-		auto request_size = std::min(static_cast<uint64_t>(STANDARD_VECTOR_SIZE) * 50, job_params.tuple_count);
+		auto request_size = std::min(batch_size, job_params.tuple_count);
 		current_batch = make_shared_ptr<ArrowArrayWrapper>();
 		current_batch->arrow_array =
-		    IgnitionRuntime::Get().decode_batch(ignition_job, job_params.start_tuple, request_size);
+		    AnyBloxRuntime::Get().decode_batch(anyblox_job, job_params.start_tuple, request_size);
 		current_batch_idx = 0;
 		job_params.start_tuple += current_batch->arrow_array.length;
 		job_params.tuple_count -= current_batch->arrow_array.length;
@@ -284,7 +290,7 @@ void IgnitionLocalState::ReadBatch(DataChunk &output, const vector<OutputColumnI
 	for (idx_t idx = 0; idx < output.ColumnCount(); idx += 1) {
 		auto [idx_in_array, idx_in_schema] = output_column_ids[idx];
 		auto &column_array = *array.children[idx_in_array];
-		auto arrow_type = ignition_job->schema()->fields()[idx_in_schema]->type();
+		auto arrow_type = anyblox_job->schema()->fields()[idx_in_schema]->type();
 		D_ASSERT(column_array.release);
 		D_ASSERT(column_array.length == array.length);
 
@@ -297,15 +303,15 @@ void IgnitionLocalState::ReadBatch(DataChunk &output, const vector<OutputColumnI
 	output.SetCardinality(size_to_write);
 }
 
-bool IgnitionLocalState::IsFinished() const {
+bool AnyBloxLocalState::IsFinished() const {
 	return RemainingInBatch() == 0 && job_params.tuple_count == 0;
 }
 
-void IgnitionLocalState::SetNewJob(JobParams job_params) {
+void AnyBloxLocalState::SetNewJob(JobParams job_params) {
 	this->job_params = job_params;
 }
 
-void IgnitionLocalState::SetValidityMask(Vector &vector, ArrowArray &array, idx_t offset, size_t len) {
+void AnyBloxLocalState::SetValidityMask(Vector &vector, ArrowArray &array, idx_t offset, size_t len) {
 	D_ASSERT(vector.GetVectorType() == VectorType::FLAT_VECTOR);
 	D_ASSERT(offset % 8 == 0);
 	auto &mask = FlatVector::Validity(vector);
@@ -320,7 +326,7 @@ void IgnitionLocalState::SetValidityMask(Vector &vector, ArrowArray &array, idx_
 	memcpy(mask.GetData(), src_ptr, n_bitmask_bytes);
 }
 
-void IgnitionLocalState::ColumnArrowToDuckDB(Vector &vector, ArrowArray &array, const arrow::DataType &arrow_type,
+void AnyBloxLocalState::ColumnArrowToDuckDB(Vector &vector, ArrowArray &array, const arrow::DataType &arrow_type,
                                              idx_t offset, size_t len) {
 	switch (vector.GetType().id()) {
 	case LogicalTypeId::SQLNULL:
@@ -420,7 +426,7 @@ void IgnitionLocalState::ColumnArrowToDuckDB(Vector &vector, ArrowArray &array, 
 	}
 }
 
-void IgnitionLocalState::SetVectorString(Vector &vector, const char *cdata, const uint32_t *offsets, idx_t size) {
+void AnyBloxLocalState::SetVectorString(Vector &vector, const char *cdata, const uint32_t *offsets, idx_t size) {
 	auto strings = FlatVector::GetData<string_t>(vector);
 	for (idx_t row_idx = 0; row_idx < size; row_idx++) {
 		if (FlatVector::IsNull(vector, row_idx)) {
@@ -432,7 +438,7 @@ void IgnitionLocalState::SetVectorString(Vector &vector, const char *cdata, cons
 	}
 }
 
-void IgnitionLocalState::SetVectorStringView(Vector &vector, idx_t size, ArrowArray &array, idx_t offset) {
+void AnyBloxLocalState::SetVectorStringView(Vector &vector, idx_t size, ArrowArray &array, idx_t offset) {
 	auto strings = FlatVector::GetData<string_t>(vector);
 	auto arrow_string = static_cast<const arrow_string_view_t *>(array.buffers[1]) + offset;
 
@@ -560,9 +566,9 @@ LogicalType TranslateArrowType(const arrow::DataType &data_type) {
 }
 } // namespace
 
-void IgnitionFunction(ClientContext & /* context */, TableFunctionInput &data, DataChunk &output) {
-	auto &global_state = data.global_state.get()->Cast<IgnitionGlobalState>();
-	auto &local_state = data.local_state.get()->Cast<IgnitionLocalState>();
+void AnyBloxFunction(ClientContext & /* context */, TableFunctionInput &data, DataChunk &output) {
+	auto &global_state = data.global_state.get()->Cast<AnyBloxGlobalState>();
+	auto &local_state = data.local_state.get()->Cast<AnyBloxLocalState>();
 
 	if (local_state.IsFinished()) {
 		auto new_job = global_state.AcquireNextJob();
@@ -577,19 +583,19 @@ void IgnitionFunction(ClientContext & /* context */, TableFunctionInput &data, D
 	local_state.ReadBatch(output, global_state.GetOutputColumnIds());
 }
 
-unique_ptr<FunctionData> IgnitionBind(ClientContext &context, TableFunctionBindInput &input,
+unique_ptr<FunctionData> AnyBloxBind(ClientContext &context, TableFunctionBindInput &input,
                                       vector<LogicalType> &logicals, vector<string> &names) {
-	IgnitionRuntime::GetOrInit(context);
+	AnyBloxRuntime::GetOrInit(context);
 	assert(input.inputs.size() == 1);
-	auto ignition_path = input.inputs.front().GetValue<std::string>();
+	auto anyblox_path = input.inputs.front().GetValue<std::string>();
 	auto data_path_iter = input.named_parameters.find("data");
 	std::optional<std::string> data_path = data_path_iter != input.named_parameters.end()
 	                                           ? data_path_iter->second.GetValue<std::string>()
 	                                           : std::optional<std::string> {};
-	ignition::IgnitionBundle bundle =
-	    data_path.has_value() ? ignition::IgnitionBundle::open_extension_and_data(ignition_path, data_path.value())
-	                          : ignition::IgnitionBundle::open_self_contained(ignition_path);
-	ignition::IgnitionMetadata metadata = bundle.metadata();
+	anyblox::AnyBloxBundle bundle =
+	    data_path.has_value() ? anyblox::AnyBloxBundle::open_extension_and_data(anyblox_path, data_path.value())
+	                          : anyblox::AnyBloxBundle::open_self_contained(anyblox_path);
+	anyblox::AnyBloxMetadata metadata = bundle.metadata();
 
 	for (const auto &field : metadata.schema->fields()) {
 		names.emplace_back(field->name());
@@ -597,38 +603,38 @@ unique_ptr<FunctionData> IgnitionBind(ClientContext &context, TableFunctionBindI
 		logicals.emplace_back(type);
 	}
 
-	return make_uniq<IgnitionFunctionData>(ignition_path, data_path, std::move(metadata));
+	return make_uniq<AnyBloxFunctionData>(anyblox_path, data_path, std::move(metadata));
 }
 
-unique_ptr<GlobalTableFunctionState> IgnitionGlobalInit(ClientContext &context, TableFunctionInitInput &input) {
-	const auto &data = input.bind_data.get()->Cast<IgnitionFunctionData>();
+unique_ptr<GlobalTableFunctionState> AnyBloxGlobalInit(ClientContext &context, TableFunctionInitInput &input) {
+	const auto &data = input.bind_data.get()->Cast<AnyBloxFunctionData>();
 	auto bundle = data.OpenBundle();
 	uint64_t max_threads = context.db->NumberOfThreads();
 
-	return make_uniq<IgnitionGlobalState>(std::move(bundle), std::move(data.GetSchema()), input.column_ids,
+	return make_uniq<AnyBloxGlobalState>(std::move(bundle), std::move(data.GetSchema()), input.column_ids,
 	                                      max_threads);
 }
 
-unique_ptr<LocalTableFunctionState> IgnitionLocalInit(ExecutionContext &context, TableFunctionInitInput & /* input */,
+unique_ptr<LocalTableFunctionState> AnyBloxLocalInit(ExecutionContext &context, TableFunctionInitInput & /* input */,
                                                       GlobalTableFunctionState *global_state) {
-	auto &ignition_state = global_state->Cast<IgnitionGlobalState>();
-	return make_uniq<IgnitionLocalState>(context.client, ignition_state.GetBundle(),
-	                                     ignition_state.GetColumnProjection());
+	auto &anyblox_state = global_state->Cast<AnyBloxGlobalState>();
+	return make_uniq<AnyBloxLocalState>(context.client, anyblox_state.GetBundle(),
+	                                     anyblox_state.GetColumnProjection());
 }
 
-unique_ptr<NodeStatistics> IgnitionCardinality(ClientContext & /* context */, const FunctionData *bind_data) {
-	const auto &ignition_data = bind_data->Cast<IgnitionFunctionData>();
-	auto row_count = ignition_data.GetMetadata().data.count;
+unique_ptr<NodeStatistics> AnyBloxCardinality(ClientContext & /* context */, const FunctionData *bind_data) {
+	const auto &anyblox_data = bind_data->Cast<AnyBloxFunctionData>();
+	auto row_count = anyblox_data.GetMetadata().data.count;
 	return make_uniq<NodeStatistics>(row_count, row_count);
 }
 
-unique_ptr<BaseStatistics> IgnitionStatistics(ClientContext & /* context */, const FunctionData *bind_data,
+unique_ptr<BaseStatistics> AnyBloxStatistics(ClientContext & /* context */, const FunctionData *bind_data,
                                               column_t column_index) {
 	if (column_index == COLUMN_IDENTIFIER_ROW_ID) {
 		return nullptr;
 	}
-	const auto &ignition_data = bind_data->Cast<IgnitionFunctionData>();
-	const auto &column = ignition_data.GetMetadata().schema->fields()[column_index];
+	const auto &anyblox_data = bind_data->Cast<AnyBloxFunctionData>();
+	const auto &column = anyblox_data.GetMetadata().schema->fields()[column_index];
 
 	auto stats = BaseStatistics::CreateUnknown(TranslateArrowType(*column->type()));
 	if (!column->nullable()) {
@@ -639,15 +645,15 @@ unique_ptr<BaseStatistics> IgnitionStatistics(ClientContext & /* context */, con
 }
 
 static void LoadInternal(DatabaseInstance &instance) {
-	auto ignition_table_function = TableFunction("ignition", {LogicalTypeId::VARCHAR}, IgnitionFunction, IgnitionBind,
-	                                             IgnitionGlobalInit, IgnitionLocalInit);
-	ignition_table_function.projection_pushdown = true;
-	ignition_table_function.filter_pushdown = false;
-	ignition_table_function.filter_prune = false;
-	ignition_table_function.named_parameters.insert({"data", LogicalTypeId::VARCHAR});
-	ignition_table_function.cardinality = IgnitionCardinality;
-	ignition_table_function.statistics = IgnitionStatistics;
-	ExtensionUtil::RegisterFunction(instance, ignition_table_function);
+	auto anyblox_table_function = TableFunction("anyblox", {LogicalTypeId::VARCHAR}, AnyBloxFunction, AnyBloxBind,
+	                                             AnyBloxGlobalInit, AnyBloxLocalInit);
+	anyblox_table_function.projection_pushdown = true;
+	anyblox_table_function.filter_pushdown = false;
+	anyblox_table_function.filter_prune = false;
+	anyblox_table_function.named_parameters.insert({"data", LogicalTypeId::VARCHAR});
+	anyblox_table_function.cardinality = AnyBloxCardinality;
+	anyblox_table_function.statistics = AnyBloxStatistics;
+	ExtensionUtil::RegisterFunction(instance, anyblox_table_function);
 
 	auto &config = DBConfig::GetConfig(instance);
 	config.AddExtensionOption(CONFIG_WASM_VIRTUAL_MEMORY_LIMIT,
@@ -664,17 +670,17 @@ static void LoadInternal(DatabaseInstance &instance) {
 	    LogicalTypeId::BOOLEAN, Value(true));
 }
 
-void IgnitionExtension::Load(DuckDB &db) {
+void AnybloxExtension::Load(DuckDB &db) {
 	LoadInternal(*db.instance);
 }
 
-std::string IgnitionExtension::Name() {
-	return "ignition";
+std::string AnybloxExtension::Name() {
+	return "anyblox";
 }
 
-std::string IgnitionExtension::Version() const {
-#ifdef EXT_VERSION_IGNITION
-	return EXT_VERSION_IGNITION;
+std::string AnybloxExtension::Version() const {
+#ifdef EXT_VERSION_ANYBLOX
+	return EXT_VERSION_ANYBLOX;
 #else
 	return "";
 #endif
@@ -684,12 +690,12 @@ std::string IgnitionExtension::Version() const {
 
 extern "C" {
 
-DUCKDB_EXTENSION_API void ignition_init(duckdb::DatabaseInstance &db) {
+DUCKDB_EXTENSION_API void anyblox_init(duckdb::DatabaseInstance &db) {
 	duckdb::DuckDB db_wrapper(db);
-	db_wrapper.LoadExtension<duckdb::IgnitionExtension>();
+	db_wrapper.LoadExtension<duckdb::AnybloxExtension>();
 }
 
-DUCKDB_EXTENSION_API const char *ignition_version() {
+DUCKDB_EXTENSION_API const char *anyblox_version() {
 	return duckdb::DuckDB::LibraryVersion();
 }
 }
